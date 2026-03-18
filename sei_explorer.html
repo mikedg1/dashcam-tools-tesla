@@ -632,7 +632,7 @@
                 <div class="meta-list" id="metaList"></div>
             </div>
             <button class="export-btn" id="exportBtn" disabled>Export CSV</button>
-            <button class="export-btn" id="exportVideoBtn" disabled>Export Video with Overlay</button>
+            <button class="export-btn" id="exportVideoBtn" disabled>Export Video with Overlay (MP4)</button>
             <div id="exportProgress" style="display:none; font-size:0.75rem; color:var(--text-muted); text-align:center;"></div>
         </aside>
     </main>
@@ -641,11 +641,16 @@
 <script src="vendor/protobuf.min.js"></script>
 <script src="vendor/jszip.min.js"></script>
 <script src="dashcam-mp4.js"></script>
+<!-- ffmpeg.wasm -->
+<script src="vendor/ffmpeg.min.js"></script>
+<!-- COI Service Worker to enable SharedArrayBuffer on GitHub Pages / Localhost -->
+<script src="vendor/coi-serviceworker.min.js"></script>
 <script>
     // State
     let seiType = null, seiFields = null, seiFieldsCsv = null;
     let mp4 = null, frames = null, firstKeyframe = 0;
     let currentFileName = null;
+    let ffmpeg = null;
     let decoder = null, decoding = false, pendingFrame = null;
     let playing = false, playTimer = null;
 
@@ -935,67 +940,90 @@
         pause();
         exportVideoBtn.disabled = true;
         exportProgress.style.display = 'block';
-        exportProgress.textContent = 'Preparing...';
+        exportProgress.textContent = 'Initializing FFmpeg...';
+
+        const FFmpegLib = window.FFmpegWASM || {};
+        const { FFmpeg } = FFmpegLib;
+        if (!FFmpeg) {
+            alert('FFmpeg.wasm not loaded. Please check your internet connection or if SharedArrayBuffer is supported.');
+            exportVideoBtn.disabled = false;
+            exportProgress.style.display = 'none';
+            return;
+        }
+
+        if (!ffmpeg) {
+            ffmpeg = new FFmpeg();
+            ffmpeg.on('log', ({ message }) => console.log('[ffmpeg]', message));
+            ffmpeg.on('progress', ({ progress }) => {
+                if (exportProgress.dataset.state === 'encoding') {
+                    exportProgress.textContent = `Encoding MP4: ${Math.round(progress * 100)}%`;
+                }
+            });
+            await ffmpeg.load({
+                coreURL: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js',
+                wasmURL: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.wasm',
+                workerURL: 'vendor/ffmpeg.min.js'
+            });
+        }
 
         const config = mp4.getConfig();
         const w = config.width, h = config.height;
-
-        // Offscreen canvas for compositing
         const offCanvas = new OffscreenCanvas(w, h);
         const offCtx = offCanvas.getContext('2d');
 
-        // Visible canvas to stream from (MediaRecorder needs a real canvas)
-        const recCanvas = document.createElement('canvas');
-        recCanvas.width = w;
-        recCanvas.height = h;
-        const recCtx = recCanvas.getContext('2d');
-
-        // Compute average FPS from durations
         const avgDuration = config.durations.reduce((a, b) => a + b, 0) / config.durations.length;
-        const fps = Math.round(1000 / (avgDuration || 33));
-
-        const stream = recCanvas.captureStream(0); // 0 = manual frame control
-        const recorder = new MediaRecorder(stream, {
-            mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm',
-            videoBitsPerSecond: 8_000_000
-        });
-        const chunks = [];
-        recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-
-        const recDone = new Promise(resolve => { recorder.onstop = resolve; });
-        recorder.start();
+        const fps = Math.round(1000 / (avgDuration || 33.3667)); // 29.97 usually
 
         try {
+            const frameCount = frames.length - firstKeyframe;
+            exportProgress.dataset.state = 'extracting';
+            
             for (let i = firstKeyframe; i < frames.length; i++) {
-                exportProgress.textContent = `Encoding frame ${i - firstKeyframe + 1}/${frames.length - firstKeyframe}...`;
+                const frameIdx = i - firstKeyframe;
+                exportProgress.textContent = `Processing frame ${frameIdx + 1}/${frameCount}...`;
 
-                // Decode frame to offscreen canvas
                 await decodeFrameTo(i, offCtx, w, h);
-
-                // Draw overlay
                 drawStatsOverlay(offCtx, w, h, frames[i].sei);
 
-                // Copy to recording canvas and request frame
-                recCtx.drawImage(offCanvas, 0, 0);
-                stream.getVideoTracks()[0].requestFrame();
+                const blob = await offCanvas.convertToBlob({ type: 'image/jpeg', quality: 0.95 });
+                const arrayBuffer = await blob.arrayBuffer();
+                await ffmpeg.writeFile(`f${frameIdx.toString().padStart(5, '0')}.jpg`, new Uint8Array(arrayBuffer));
 
-                // Small yield to keep UI responsive
                 await new Promise(r => setTimeout(r, 0));
             }
+
+            exportProgress.dataset.state = 'encoding';
+            exportProgress.textContent = 'Encoding MP4...';
+            
+            // ffmpeg -framerate 30 -i f%05d.jpg -c:v libx264 -pix_fmt yuv420p -crf 18 out.mp4
+            await ffmpeg.exec([
+                '-framerate', fps.toString(),
+                '-i', 'f%05d.jpg',
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-crf', '18',
+                'output.mp4'
+            ]);
+
+            const data = await ffmpeg.readFile('output.mp4');
+            const blob = new Blob([data.buffer], { type: 'video/mp4' });
+            const filename = (currentFileName || 'dashcam').replace(/\.mp4$/i, '') + '_overlay.mp4';
+            DashcamHelpers.downloadBlob(blob, filename);
+
+            // Cleanup
+            for (let i = 0; i < frameCount; i++) {
+                await ffmpeg.deleteFile(`f${i.toString().padStart(5, '0')}.jpg`);
+            }
+            await ffmpeg.deleteFile('output.mp4');
+
+            exportProgress.textContent = 'Done!';
         } catch (err) {
             console.error('Export failed:', err);
             alert('Export failed: ' + err.message);
+            exportProgress.textContent = 'Export failed.';
         }
 
-        recorder.stop();
-        await recDone;
-
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const filename = (currentFileName || 'dashcam').replace(/\.mp4$/i, '') + '_overlay.webm';
-        DashcamHelpers.downloadBlob(blob, filename);
-
-        exportProgress.textContent = 'Done!';
-        setTimeout(() => { exportProgress.style.display = 'none'; }, 2000);
+        setTimeout(() => { exportProgress.style.display = 'none'; }, 3000);
         exportVideoBtn.disabled = false;
     }
 
