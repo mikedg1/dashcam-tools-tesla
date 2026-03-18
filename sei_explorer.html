@@ -632,6 +632,8 @@
                 <div class="meta-list" id="metaList"></div>
             </div>
             <button class="export-btn" id="exportBtn" disabled>Export CSV</button>
+            <button class="export-btn" id="exportVideoBtn" disabled>Export Video with Overlay</button>
+            <div id="exportProgress" style="display:none; font-size:0.75rem; color:var(--text-muted); text-align:center;"></div>
         </aside>
     </main>
 </div>
@@ -695,6 +697,9 @@
         }
     };
     exportBtn.onclick = exportCsv;
+    const exportVideoBtn = $('exportVideoBtn');
+    const exportProgress = $('exportProgress');
+    exportVideoBtn.onclick = exportVideoWithOverlay;
 
     // Initialize protobuf
     DashcamHelpers.initProtobuf().then(({ SeiMetadata, enumFields }) => {
@@ -763,6 +768,7 @@
             currentFileName = file.name;
             fileName.textContent = file.name;
             exportBtn.disabled = false;
+            exportVideoBtn.disabled = false;
             playBtn.disabled = false;
             slider.disabled = false;
             showFrame(firstKeyframe);
@@ -776,6 +782,7 @@
             frameNum.textContent = 'Frame 0/0';
             fileName.textContent = 'No file loaded';
             exportBtn.disabled = true;
+            exportVideoBtn.disabled = true;
             playBtn.disabled = true;
             slider.disabled = true;
             dropOverlay.classList.remove('hidden');
@@ -921,6 +928,163 @@
         if (!messages.length) { alert('No SEI metadata to export.'); return; }
         const filename = (currentFileName || 'dashcam').replace(/\.mp4$/i, '') + '_sei.csv';
         DashcamHelpers.downloadBlob(new Blob([DashcamHelpers.buildCsv(messages, seiFieldsCsv)], { type: 'text/csv' }), filename);
+    }
+
+    async function exportVideoWithOverlay() {
+        if (!frames || !mp4) return;
+        pause();
+        exportVideoBtn.disabled = true;
+        exportProgress.style.display = 'block';
+        exportProgress.textContent = 'Preparing...';
+
+        const config = mp4.getConfig();
+        const w = config.width, h = config.height;
+
+        // Offscreen canvas for compositing
+        const offCanvas = new OffscreenCanvas(w, h);
+        const offCtx = offCanvas.getContext('2d');
+
+        // Visible canvas to stream from (MediaRecorder needs a real canvas)
+        const recCanvas = document.createElement('canvas');
+        recCanvas.width = w;
+        recCanvas.height = h;
+        const recCtx = recCanvas.getContext('2d');
+
+        // Compute average FPS from durations
+        const avgDuration = config.durations.reduce((a, b) => a + b, 0) / config.durations.length;
+        const fps = Math.round(1000 / (avgDuration || 33));
+
+        const stream = recCanvas.captureStream(0); // 0 = manual frame control
+        const recorder = new MediaRecorder(stream, {
+            mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm',
+            videoBitsPerSecond: 8_000_000
+        });
+        const chunks = [];
+        recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+
+        const recDone = new Promise(resolve => { recorder.onstop = resolve; });
+        recorder.start();
+
+        try {
+            for (let i = firstKeyframe; i < frames.length; i++) {
+                exportProgress.textContent = `Encoding frame ${i - firstKeyframe + 1}/${frames.length - firstKeyframe}...`;
+
+                // Decode frame to offscreen canvas
+                await decodeFrameTo(i, offCtx, w, h);
+
+                // Draw overlay
+                drawStatsOverlay(offCtx, w, h, frames[i].sei);
+
+                // Copy to recording canvas and request frame
+                recCtx.drawImage(offCanvas, 0, 0);
+                stream.getVideoTracks()[0].requestFrame();
+
+                // Small yield to keep UI responsive
+                await new Promise(r => setTimeout(r, 0));
+            }
+        } catch (err) {
+            console.error('Export failed:', err);
+            alert('Export failed: ' + err.message);
+        }
+
+        recorder.stop();
+        await recDone;
+
+        const blob = new Blob(chunks, { type: 'video/webm' });
+        const filename = (currentFileName || 'dashcam').replace(/\.mp4$/i, '') + '_overlay.webm';
+        DashcamHelpers.downloadBlob(blob, filename);
+
+        exportProgress.textContent = 'Done!';
+        setTimeout(() => { exportProgress.style.display = 'none'; }, 2000);
+        exportVideoBtn.disabled = false;
+    }
+
+    async function decodeFrameTo(index, targetCtx, w, h) {
+        let keyIdx = index;
+        while (keyIdx >= 0 && !frames[keyIdx].keyframe) keyIdx--;
+        if (keyIdx < 0) throw new Error('No preceding keyframe');
+
+        let count = 0;
+        const target = index - keyIdx + 1;
+
+        const dec = await new Promise((resolve, reject) => {
+            const d = new VideoDecoder({
+                output: frame => {
+                    if (++count === target) targetCtx.drawImage(frame, 0, 0, w, h);
+                    frame.close();
+                    if (count >= target) resolve(d);
+                },
+                error: reject
+            });
+            const cfg = mp4.getConfig();
+            d.configure({ codec: cfg.codec, width: cfg.width, height: cfg.height });
+            for (let i = keyIdx; i <= index; i++) d.decode(createChunk(frames[i]));
+            d.flush().catch(reject);
+        });
+        try { dec.close(); } catch {}
+    }
+
+    function drawStatsOverlay(ctx2, w, h, sei) {
+        if (!sei) return;
+        const scale = w / 1280; // scale relative to 1280px reference
+        const pad = 12 * scale;
+        const boxW = 220 * scale;
+        const boxH = 70 * scale;
+        const cx = w / 2;
+        const y0 = 32 * scale;
+
+        ctx2.save();
+        ctx2.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx2.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx2.lineWidth = 2 * scale;
+        const r = 12 * scale;
+        ctx2.beginPath();
+        ctx2.roundRect(cx - boxW / 2, y0, boxW, boxH, r);
+        ctx2.fill();
+        ctx2.stroke();
+
+        ctx2.fillStyle = '#fff';
+        ctx2.textAlign = 'center';
+        ctx2.textBaseline = 'middle';
+
+        // Speed
+        const speedMps = sei.vehicleSpeedMps || 0;
+        const speedDisplay = Math.round(speedMps * (useMph ? 2.237 : 3.6));
+        ctx2.font = `bold ${28 * scale}px system-ui`;
+        ctx2.fillText(speedDisplay, cx, y0 + boxH * 0.4);
+        ctx2.font = `${10 * scale}px system-ui`;
+        ctx2.fillStyle = 'rgba(255,255,255,0.7)';
+        ctx2.fillText(useMph ? 'mph' : 'km/h', cx, y0 + boxH * 0.7);
+
+        // Gear
+        const gearMap = { 0: 'P', 1: 'D', 2: 'R', 3: 'N' };
+        ctx2.fillStyle = '#fff';
+        ctx2.font = `bold ${12 * scale}px system-ui`;
+        ctx2.fillText(gearMap[sei.gearState] || 'P', cx - boxW * 0.35, y0 + boxH * 0.35);
+
+        // Steering angle
+        ctx2.font = `${10 * scale}px system-ui`;
+        ctx2.fillStyle = 'rgba(255,255,255,0.8)';
+        const angle = (sei.steeringWheelAngle || 0).toFixed(0);
+        ctx2.fillText(`${angle}°`, cx + boxW * 0.35, y0 + boxH * 0.35);
+
+        // Brake
+        if (sei.brakeApplied) {
+            ctx2.fillStyle = 'rgba(233,146,75,0.9)';
+            ctx2.font = `bold ${9 * scale}px system-ui`;
+            ctx2.fillText('BRK', cx - boxW * 0.35, y0 + boxH * 0.7);
+        }
+
+        // Autopilot
+        const apMap = { 1: 'FSD', 2: 'Autosteer', 3: 'TACC' };
+        const apText = apMap[sei.autopilotState];
+        if (apText) {
+            ctx2.fillStyle = '#0070ff';
+            ctx2.font = `bold ${9 * scale}px system-ui`;
+            ctx2.fillText(apText, cx, y0 - 4 * scale);
+        }
+
+        ctx2.restore();
     }
 
     function showError(msg) {
